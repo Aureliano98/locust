@@ -114,7 +114,12 @@ class LocustRunner(object):
 
         return bucket
 
-    def spawn_locusts(self, spawn_count, wait=False):
+    def spawn_locusts(self, spawn_count, wait=False, hatch_rate=None):
+        logger.info(f'spawn_locusts(spawn_count={spawn_count}, wait={wait}, hatch_rate={hatch_rate})') 
+
+        if hatch_rate is None:
+            hatch_rate = self.hatch_rate    
+
         bucket = self.weight_locusts(spawn_count)
         spawn_count = len(bucket)
         if self.state == STATE_INIT or self.state == STATE_STOPPED:
@@ -201,7 +206,12 @@ class LocustRunner(object):
                 self.cpu_warning_emitted = True
             gevent.sleep(CPU_MONITOR_INTERVAL)
 
-    def start_hatching(self, locust_count, hatch_rate, wait=False):
+    def start_hatching(self, locust_count, hatch_rate, wait=False, **kwargs):
+        series = kwargs.pop('series', None)
+        if series is not None:
+            self.start_hatching_fit(series, wait=wait, **kwargs)
+            return
+
         if self.state != STATE_RUNNING and self.state != STATE_HATCHING:
             self.stats.clear_all()
             self.exceptions = {}
@@ -226,6 +236,56 @@ class LocustRunner(object):
         else:
             self.hatch_rate = hatch_rate
             self.spawn_locusts(locust_count, wait=wait)
+
+    def start_hatching_fit(self, series, wait=False, **kwargs):
+        import pandas as pd
+        from datetime import datetime
+        from scipy import interpolate
+
+        if not isinstance(series, pd.Series):
+            raise TypeError('series not understood')
+
+        if self.state != STATE_RUNNING and self.state != STATE_HATCHING:
+            self.stats.clear_all()
+            self.exceptions = {}
+            self.cpu_warning_emitted = False
+            self.slave_cpu_warning_emitted = False
+            events.locust_start_hatching.fire()
+
+        start_time = datetime.now()
+        def elapsed_seconds():
+            return (datetime.now() - start_time).total_seconds()
+
+        interp_func = interpolate.interp1d(series.index, series)
+
+        # Dynamically changing the locust count
+        if self.state != STATE_INIT and self.state != STATE_STOPPED:
+            self.state = STATE_HATCHING
+
+        lookahead = 10.
+        while True:
+            logger.info(f'user_count: {self.user_count}, desired: {interp_func(elapsed_seconds())}')
+
+            diff = elapsed_seconds()
+            pos = series.index.searchsorted(diff + lookahead)
+            if pos == len(series):
+                if series.index.iloc[-1] > diff:
+                    gevent.sleep(series.index.iloc[-1] - diff)
+                events.hatch_complete.fire(user_count=self.user_count)
+                break
+
+            locust_count = round(series.iloc[pos])
+            if locust_count > self.user_count:
+                spawn_count = locust_count - self.user_count
+                hatch_rate = spawn_count / lookahead
+                self.spawn_locusts(spawn_count=spawn_count, hatch_rate=hatch_rate)
+            elif locust_count < self.user_count:
+                self.kill_locusts(self.user_count - locust_count)
+            
+            sleep_secs = series.index[pos] - elapsed_seconds()
+            logger.info(f'Shall sleep {sleep_secs} seconds')
+            gevent.sleep(sleep_secs)
+
 
     def start_stepload(self, locust_count, hatch_rate, step_locust_count, step_duration):
         if locust_count < step_locust_count:
@@ -288,13 +348,14 @@ class LocalLocustRunner(LocustRunner):
             self.log_exception("local", str(exception), formatted_tb)
         events.locust_error += on_locust_error
 
-    def start_hatching(self, locust_count, hatch_rate, wait=False):
+    def start_hatching(self, locust_count, hatch_rate, wait=False, **kwargs):
         if hatch_rate > 100:
             logger.warning("Your selected hatch rate is very high (>100), and this is known to sometimes cause issues. Do you really need to ramp up that fast?")
         if self.hatching_greenlet:
             # kill existing hatching_greenlet before we start a new one
             self.hatching_greenlet.kill(block=True)
-        self.hatching_greenlet = self.greenlet.spawn(lambda: super(LocalLocustRunner, self).start_hatching(locust_count, hatch_rate, wait=wait))
+        self.hatching_greenlet = self.greenlet.spawn(lambda: super(LocalLocustRunner, self) \
+            .start_hatching(locust_count, hatch_rate, wait=wait, **kwargs))
 
 
 class DistributedLocustRunner(LocustRunner):

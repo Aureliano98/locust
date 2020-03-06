@@ -282,6 +282,21 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
     )
 
     parser.add_argument(
+        '--series',
+        help='path to series CSV'
+    )
+
+    parser.add_argument(
+        '--max-users',
+        help='vertical scale of series'
+    )
+
+    parser.add_argument(
+        '--timespan',
+        help='horizontal scale of series'
+    )
+
+    parser.add_argument(
         'locust_classes',
         nargs='*',
         metavar='LocustClass',
@@ -298,6 +313,16 @@ def _is_package(path):
         os.path.isdir(path)
         and os.path.exists(os.path.join(path, '__init__.py'))
     )
+
+
+def _normalize(series, max_users=None, timespan=None):
+    series = series.copy()
+    if max_users is not None:
+        series = series * max_users / series.max()
+    series.index = series.index - series.index[0]    
+    if timespan is not None:
+        series.index = series.index * timespan / series.index.max()
+    return series
 
 
 def find_locustfile(locustfile):
@@ -513,7 +538,15 @@ def main():
         if options.step_time:
             runners.locust_runner.start_stepload(options.num_clients, options.hatch_rate, options.step_clients, options.step_time)
         elif not options.slave:
-            runners.locust_runner.start_hatching(options.num_clients, options.hatch_rate)
+            if options.series is not None:
+                # The branch we need to work on (for now)
+                import pandas as pd
+                series = pd.read_csv(options.series, index_col=0).iloc[:, 0]
+                series = _normalize(series, max_users=options.max_users, timespan=options.timespan)
+                logger.info(f'Series loaded from {options.series}:\n{series.describe()}')
+                runners.locust_runner.start_hatching(options.num_clients, options.hatch_rate, series=series)
+            else:
+                runners.locust_runner.start_hatching(options.num_clients, options.hatch_rate)
             # make locusts are spawned
             time.sleep(1)
     elif not options.slave:
