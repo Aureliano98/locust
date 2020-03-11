@@ -281,19 +281,29 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
         help="Number of seconds to wait for a simulated user to complete any executing task before exiting. Default is to terminate immediately. This parameter only needs to be specified for the master process when running Locust distributed."
     )
 
+    # 3 added arguments for workload replay
     parser.add_argument(
         '--series',
-        help='path to series CSV'
+        help='path to workload series CSV'
     )
 
     parser.add_argument(
         '--max-users',
+        type=int,
         help='vertical scale of series'
     )
 
     parser.add_argument(
         '--timespan',
-        help='horizontal scale of series'
+        type=float,
+        help='horizontal scale of series (in seconds)'
+    )
+
+    parser.add_argument(
+        '--lookahead',
+        type=float,
+        default=10.,
+        help='parameter for workload replay'
     )
 
     parser.add_argument(
@@ -543,8 +553,13 @@ def main():
                 import pandas as pd
                 series = pd.read_csv(options.series, index_col=0).iloc[:, 0]
                 series = _normalize(series, max_users=options.max_users, timespan=options.timespan)
-                logger.info(f'Series loaded from {options.series}:\n{series.describe()}')
-                runners.locust_runner.start_hatching(options.num_clients, options.hatch_rate, series=series)
+                logger.info('Series loaded from %s:\n%s', options.series, series.describe())
+                runners.locust_runner.start_hatching(
+                    options.num_clients,
+                    options.hatch_rate,
+                    series=series,
+                    lookahead=options.lookahead
+                )
             else:
                 runners.locust_runner.start_hatching(options.num_clients, options.hatch_rate)
             # make locusts are spawned
