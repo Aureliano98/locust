@@ -74,6 +74,29 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
         help="Store each stats entry in CSV format to _stats_history.csv file",
     )
 
+    parser.add_argument(
+        '--mongo',
+        action='store_true',
+        default=False,
+        help="Replicate CSV output to MongoDB.",
+    )
+
+    parser.add_argument(
+        '--mongo-host',
+        help="MongoDB host.",
+    )
+
+    parser.add_argument(
+        '--mongo-port',
+        help="MongoDB port.",
+    )
+
+    parser.add_argument(
+        '--mongo-db',
+        default='locust',
+        help="MongoDB database name.",
+    )
+
     # if locust should be run in distributed mode as master
     parser.add_argument(
         '--master',
@@ -288,12 +311,6 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
     )
 
     parser.add_argument(
-        '--max-users',
-        type=int,
-        help='vertical scale of series'
-    )
-
-    parser.add_argument(
         '--timespan',
         type=float,
         help='horizontal scale of series (in seconds)'
@@ -325,13 +342,16 @@ def _is_package(path):
     )
 
 
-def _normalize(series, max_users=None, timespan=None):
+def _normalize(series, max_clients=None, run_time=None):
+    from datetime import timedelta
     series = series.copy()
-    if max_users is not None:
-        series = series * max_users / series.max()
+    if max_clients is not None:
+        series = series * max_clients / series.max()
     series.index = series.index - series.index[0]    
-    if timespan is not None:
-        series.index = series.index * timespan / series.index.max()
+    if run_time is not None:
+        if isinstance(run_time, timedelta):
+            run_time = run_time.total_seconds()
+        series.index = series.index * run_time / series.index.max()
     return series
 
 
@@ -506,11 +526,43 @@ def main():
         except ValueError:
             logger.error("Valid --run-time formats are: 20, 20s, 3m, 2h, 1h20m, 3h30m10s, etc.")
             sys.exit(1)
+
         def spawn_run_time_limit_greenlet():
             logger.info("Run time limit set to %s seconds" % options.run_time)
+
             def timelimit_stop():
                 logger.info("Time limit reached. Stopping Locust.")
                 runners.locust_runner.quit()
+
+                # When --mongo flag is set, write CSV to MongoDB
+                if options.mongo:
+                    import pandas as pd
+                    from pymongo import MongoClient
+
+                    mongo_client = MongoClient(host=options.mongo_host,
+                                               port=options.mongo_port)
+                    suffix_to_col = {
+                        '_stats.csv': 'requests',
+                        '_stats_history.csv': 'distributions',
+                        '_failures.csv': 'failures',
+                    }
+
+                    def encode(key):
+                        """Ref: https://stackoverflow.com/questions/12397118/mongodb-dot-in-key-name
+                        """
+                        return key.replace('[', '[[').replace(']', ']]').replace('.', '[dot]')
+
+                    for suffix, col in suffix_to_col.items():
+                        try:
+                            df = pd.read_csv(options.csvfilebase + suffix)
+                            if len(df) == 0:
+                                continue
+                            df = df.rename(columns=encode)
+                            rows = list(df.to_dict(orient='index').values())
+                            mongo_client[options.mongo_db][col].insert_many(rows)
+                        except FileNotFoundError:
+                            continue
+
             gevent.spawn_later(options.run_time, timelimit_stop)
 
     if options.step_time:
@@ -551,8 +603,11 @@ def main():
             if options.series is not None:
                 # The branch we need to work on (for now)
                 import pandas as pd
+                if options.run_time is None:
+                    logger.error('--run-time must be set when --series is set')
+                    sys.exit(-1)
                 series = pd.read_csv(options.series, index_col=0).iloc[:, 0]
-                series = _normalize(series, max_users=options.max_users, timespan=options.timespan)
+                series = _normalize(series, max_clients=options.num_clients, run_time=options.run_time)
                 logger.info('Series loaded from %s:\n%s', options.series, series.describe())
                 runners.locust_runner.start_hatching(
                     options.num_clients,
