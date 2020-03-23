@@ -323,6 +323,16 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
         help='parameter for workload replay'
     )
 
+    # Return specified code, disregarding lr.errors, lr.exceptions, lr.cpu_log_warning
+    # (lr == runners.locust_runner).
+    # This may be useful for deployment as a Kubernetes job.
+    parser.add_argument(
+        '--code',
+        type=int,
+        default=None,
+        help='return code'
+    )
+
     parser.add_argument(
         'locust_classes',
         nargs='*',
@@ -664,10 +674,13 @@ def main():
     try:
         logger.info("Starting Locust %s" % version)
         main_greenlet.join()
-        code = 0
-        lr = runners.locust_runner
-        if len(lr.errors) or len(lr.exceptions) or lr.cpu_log_warning():
-            code = options.exit_code_on_error
+        if options.code is None:
+            code = 0
+            lr = runners.locust_runner
+            if len(lr.errors) or len(lr.exceptions) or lr.cpu_log_warning():
+                code = options.exit_code_on_error
+        else:
+            code = options.code
         shutdown(code=code)
     except KeyboardInterrupt as e:
         shutdown(0)
