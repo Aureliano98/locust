@@ -18,7 +18,9 @@ from .inspectlocust import get_task_ratio_dict, print_task_ratio
 from .log import console_logger, setup_logging
 from .runners import LocalLocustRunner, MasterLocustRunner, SlaveLocustRunner
 from .stats import (print_error_report, print_percentile_stats, print_stats,
-                    stats_printer, stats_writer, write_stat_csvs)
+                    stats_printer, stats_writer, write_stat_csvs, 
+                    stats_history_csv_header, stats_history_csv,
+                    requests_csv, failures_csv)
 from .util.timespan import parse_timespan
 
 _internals = [Locust, HttpLocust]
@@ -74,6 +76,7 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
         help="Store each stats entry in CSV format to _stats_history.csv file",
     )
 
+    # MongoDB options
     parser.add_argument(
         '--mongo',
         action='store_true',
@@ -95,6 +98,12 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
         '--mongo-db',
         default='locust',
         help="MongoDB database name.",
+    )
+
+    # Add a tag for each document, useful for differentiating experiments
+    parser.add_argument(
+        '--mongo-tag',
+        help="Additional tag for docs written to MongoDB.",
     )
 
     # if locust should be run in distributed mode as master
@@ -546,32 +555,50 @@ def main():
 
                 # When --mongo flag is set, write CSV to MongoDB
                 if options.mongo:
+                    import tempfile
                     import pandas as pd
                     from pymongo import MongoClient
 
                     mongo_client = MongoClient(host=options.mongo_host,
                                                port=options.mongo_port)
-                    suffix_to_col = {
-                        '_stats.csv': 'requests',
-                        '_stats_history.csv': 'distributions',
-                        '_failures.csv': 'failures',
-                    }
 
                     def encode(key):
                         """Ref: https://stackoverflow.com/questions/12397118/mongodb-dot-in-key-name
                         """
                         return key.replace('[', '[[').replace(']', ']]').replace('.', '[dot]')
 
-                    for suffix, col in suffix_to_col.items():
-                        try:
-                            df = pd.read_csv(options.csvfilebase + suffix)
-                            if len(df) == 0:
+                    with tempfile.NamedTemporaryFile(mode='w') as stats_history_file, \
+                        tempfile.NamedTemporaryFile(mode='w') as stats_file, \
+                        tempfile.NamedTemporaryFile(mode='w') as failures_file:
+
+                        stats_history_file.write(stats_history_csv_header())
+                        stats_history_file.write(stats_history_csv(options.stats_history_enabled) + "\n")
+                        stats_file.write(requests_csv())
+                        failures_file.write(failures_csv())
+
+                        stats_history_file.flush()
+                        stats_file.flush()
+                        failures_file.flush()
+
+                        files = {
+                            'requests': stats_file.name,
+                            'distributions': stats_history_file.name,
+                            'failures': failures_file.name,
+                        }
+
+                        for col, filename in files.items():
+                            try:
+                                df = pd.read_csv(filename)
+                                print(df)
+                                if len(df) == 0:    # Empty lists not allowed for `insert_many`
+                                    continue
+                                if options.mongo_tag is not None:
+                                    df['tag'] = options.mongo_tag
+                                df = df.rename(columns=encode)
+                                rows = list(df.to_dict(orient='index').values())
+                                mongo_client[options.mongo_db][col].insert_many(rows)
+                            except FileNotFoundError:
                                 continue
-                            df = df.rename(columns=encode)
-                            rows = list(df.to_dict(orient='index').values())
-                            mongo_client[options.mongo_db][col].insert_many(rows)
-                        except FileNotFoundError:
-                            continue
 
             gevent.spawn_later(options.run_time, timelimit_stop)
 
