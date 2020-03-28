@@ -571,8 +571,14 @@ def main():
                         tempfile.NamedTemporaryFile(mode='w') as stats_file, \
                         tempfile.NamedTemporaryFile(mode='w') as failures_file:
 
-                        stats_history_file.write(stats_history_csv_header())
+                        with open(options.csvfilebase + '_stats_history.csv') as f:
+                            content = f.read()
+                            if content:
+                                stats_history_file.write(content)
+                            else:
+                                stats_history_file.write(stats_history_csv_header())
                         stats_history_file.write(stats_history_csv(options.stats_history_enabled) + "\n")
+
                         stats_file.write(requests_csv())
                         failures_file.write(failures_csv())
 
