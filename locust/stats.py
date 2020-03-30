@@ -30,6 +30,7 @@ CURRENT_RESPONSE_TIME_PERCENTILE_WINDOW = 10
 CachedResponseTimes = namedtuple("CachedResponseTimes", ["response_times", "num_requests"])
 
 PERCENTILES_TO_REPORT = [
+    0.25,
     0.50,
     0.66,
     0.75,
@@ -709,10 +710,11 @@ def print_stats(stats, current=True):
 
 def print_percentile_stats(stats):
     console_logger.info("Percentage of the requests completed within given times")
-    console_logger.info((" %-" + str(STATS_TYPE_WIDTH) + "s %-" + str(STATS_NAME_WIDTH) + "s %8s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s") % (
+    console_logger.info((" %-" + str(STATS_TYPE_WIDTH) + "s %-" + str(STATS_NAME_WIDTH) + "s %8s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s") % (
         'Type',
         'Name',
         '# reqs',
+        '25%',
         '50%',
         '66%',
         '75%',
@@ -774,6 +776,34 @@ def write_stat_csvs(base_filepath, stats_history_enabled=False):
         f.write(failures_csv())
 
 
+def _encode_mongo_key(key):
+    """Ref: https://stackoverflow.com/questions/12397118/mongodb-dot-in-key-name
+    """
+    return key.replace('.', '[dot]').replace('$', '[dollar]')
+
+
+def stats_history_mongo_writer(collection, stats_history_enabled=False, tags=None):
+    while True:
+        write_stats_history_to_mongo(collection, stats_history_enabled, tags)
+        gevent.sleep(CSV_STATS_INTERVAL_SEC)
+
+
+def write_stats_history_to_mongo(collection, stats_history_enabled=False, tags=None):
+    keys = [_encode_mongo_key(key.strip('"\'')) for key in stats_history_csv_header().strip().split(',')]
+    rows = stats_history_csv(stats_history_enabled, stringify=False)
+    if not rows:
+        return
+    docs = [
+        dict(zip(keys, rows))
+        for row in rows
+    ]
+    if tags:
+        for doc in docs:
+            doc.update(tags)
+    collection.insert_many(docs)
+    return docs
+
+
 def sort_stats(stats):
     return [stats[key] for key in sorted(stats.keys())]
 
@@ -795,6 +825,7 @@ def requests_csv():
             '"Average Content Size"',
             '"Requests/s"',
             '"Requests Failed/s"',
+            '"25%"',
             '"50%"',
             '"66%"',
             '"75%"',
@@ -849,6 +880,7 @@ def stats_history_csv_header():
         '"Min response time"',
         '"Max response time"',
         '"Average Content Size"',
+        '"25%"',
         '"50%"',
         '"66%"',
         '"75%"',
@@ -863,9 +895,12 @@ def stats_history_csv_header():
         '"100%"'
     )) + '\n'
 
-def stats_history_csv(stats_history_enabled=False, csv_for_web_ui=False):
+def stats_history_csv(stats_history_enabled=False, csv_for_web_ui=False, stringify=True):
     """Returns the Aggregated stats entry every interval"""
     from . import runners
+
+    if csv_for_web_ui and not stringify:
+        raise ValueError('`stringify` must be true when `csv_for_web_ui` is true')
 
     # csv_for_web_ui boolean returns the header along with the stats history row so that
     # it can be returned as a csv for download on the web ui. Otherwise when run with
@@ -889,23 +924,44 @@ def stats_history_csv(stats_history_enabled=False, csv_for_web_ui=False):
         else:
             percentile_str = ','.join(['"N/A"'] * len(PERCENTILES_TO_REPORT))
 
-        rows.append('"%s","%s","%s",%i,%i,%.2f,%.2f,%i,%i,%i,%.2f,%.2f,%s' % (
-            s.method,
-            s.name,
-            timestamp,
-            s.num_requests,
-            s.num_failures,
-            s.current_rps,
-            s.current_fail_per_sec,
-            s.median_response_time,
-            s.avg_response_time,
-            s.min_response_time or 0,
-            s.max_response_time,
-            s.avg_content_length,
-            percentile_str
-        ))
+        if stringify:
+            rows.append('"%s","%s","%s",%i,%i,%.2f,%.2f,%i,%i,%i,%.2f,%.2f,%s' % (
+                s.method,
+                s.name,
+                timestamp,
+                s.num_requests,
+                s.num_failures,
+                s.current_rps,
+                s.current_fail_per_sec,
+                s.median_response_time,
+                s.avg_response_time,
+                s.min_response_time or 0,
+                s.max_response_time,
+                s.avg_content_length,
+                percentile_str
+            ))
+        else:
+            rows.append([
+                s.method,
+                s.name,
+                timestamp,
+                s.num_requests,
+                s.num_failures,
+                s.current_rps,
+                s.current_fail_per_sec,
+                s.median_response_time,
+                s.avg_response_time,
+                s.min_response_time or 0,
+                s.max_response_time,
+                s.avg_content_length,
+                percentile_str
+            ])
 
-    return "\n".join(rows)
+    if stringify:
+        return "\n".join(rows)
+    else:
+        return rows
+
 
 def failures_csv():
     """"Return the contents of the 'failures' tab as a CSV."""

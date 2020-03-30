@@ -20,7 +20,8 @@ from .runners import LocalLocustRunner, MasterLocustRunner, SlaveLocustRunner
 from .stats import (print_error_report, print_percentile_stats, print_stats,
                     stats_printer, stats_writer, write_stat_csvs, 
                     stats_history_csv_header, stats_history_csv,
-                    requests_csv, failures_csv)
+                    requests_csv, failures_csv, stats_history_mongo_writer,
+                    _encode_mongo_key, write_stats_history_to_mongo)
 from .util.timespan import parse_timespan
 
 _internals = [Locust, HttpLocust]
@@ -69,10 +70,10 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
 
     # Adds each stats entry at every iteration to the _stats_history.csv file.
     parser.add_argument(
-        '--csv-full-history',
-        action='store_true',
-        default=False,
-        dest='stats_history_enabled',
+        '--no-csv-full-history',
+        action='store_false',
+        default=True,
+        dest='csv_stats_history_enabled',
         help="Store each stats entry in CSV format to _stats_history.csv file",
     )
 
@@ -100,10 +101,28 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
         help="MongoDB database name.",
     )
 
-    # Add a tag for each document, useful for differentiating experiments
     parser.add_argument(
-        '--mongo-tag',
-        help="Additional tag for docs written to MongoDB.",
+        '--no-mongo-full-history',
+        action='store_false',
+        default=True,
+        dest='mongo_stats_history_enabled',
+        help="Store each stats entry to `stats_history` collection.",
+    )
+
+    # MongoDB tags for differentiating experiments
+    parser.add_argument(
+        '--mongo-workload-tag',
+        help="MongoDB document tag indicating the workload.",
+    )
+
+    parser.add_argument(
+        '--mongo-env-tag',
+        help="MongoDB document tag indicating the environment.",
+    )
+
+    parser.add_argument(
+        '--mongo-exp-tag',
+        help="MongoDB document tag indicating the experiment id.",
     )
 
     # if locust should be run in distributed mode as master
@@ -553,59 +572,6 @@ def main():
                 logger.info("Time limit reached. Stopping Locust.")
                 runners.locust_runner.quit()
 
-                # When --mongo flag is set, write CSV to MongoDB
-                if options.mongo:
-                    import tempfile
-                    import pandas as pd
-                    from pymongo import MongoClient
-
-                    mongo_client = MongoClient(host=options.mongo_host,
-                                               port=options.mongo_port)
-
-                    def encode(key):
-                        """Ref: https://stackoverflow.com/questions/12397118/mongodb-dot-in-key-name
-                        """
-                        return key.replace('[', '[[').replace(']', ']]').replace('.', '[dot]')
-
-                    with tempfile.NamedTemporaryFile(mode='w') as stats_history_file, \
-                        tempfile.NamedTemporaryFile(mode='w') as stats_file, \
-                        tempfile.NamedTemporaryFile(mode='w') as failures_file:
-
-                        with open(options.csvfilebase + '_stats_history.csv') as f:
-                            content = f.read()
-                            if content:
-                                stats_history_file.write(content)
-                            else:
-                                stats_history_file.write(stats_history_csv_header())
-                        stats_history_file.write(stats_history_csv(options.stats_history_enabled) + "\n")
-
-                        stats_file.write(requests_csv())
-                        failures_file.write(failures_csv())
-
-                        stats_history_file.flush()
-                        stats_file.flush()
-                        failures_file.flush()
-
-                        files = {
-                            'requests': stats_file.name,
-                            'distributions': stats_history_file.name,
-                            'failures': failures_file.name,
-                        }
-
-                        for col, filename in files.items():
-                            try:
-                                df = pd.read_csv(filename)
-                                print(df)
-                                if len(df) == 0:    # Empty lists not allowed for `insert_many`
-                                    continue
-                                if options.mongo_tag is not None:
-                                    df['tag'] = options.mongo_tag
-                                df = df.rename(columns=encode)
-                                rows = list(df.to_dict(orient='index').values())
-                                mongo_client[options.mongo_db][col].insert_many(rows)
-                            except FileNotFoundError:
-                                continue
-
             gevent.spawn_later(options.run_time, timelimit_stop)
 
     if options.step_time:
@@ -676,8 +642,23 @@ def main():
         stats_printer_greenlet = gevent.spawn(stats_printer)
 
     if options.csvfilebase:
-        gevent.spawn(stats_writer, options.csvfilebase, options.stats_history_enabled)
+        gevent.spawn(stats_writer, options.csvfilebase, options.csv_stats_history_enabled)
 
+    if options.mongo:
+        from pymongo import MongoClient
+        mongo_client = MongoClient(host=options.mongo_host, port=options.mongo_port)
+
+        mongo_tags = {}
+        if options.mongo_workload_tag:
+            mongo_tags['workload'] = options.mongo_workload_tag
+        if options.mongo_env_tag:
+            mongo_tags['environ'] = options.mongo_env_tag
+        if options.mongo_exp_tag:
+            mongo_tags['experiment'] = options.mongo_exp_tag
+        gevent.spawn(stats_history_mongo_writer,
+                     mongo_client[options.mongo_db]['stats_history'],
+                     stats_history_enabled=options.mongo_stats_history_enabled,
+                     tags=mongo_tags)
     
     def shutdown(code=0):
         """
@@ -694,7 +675,37 @@ def main():
         print_stats(runners.locust_runner.stats, current=False)
         print_percentile_stats(runners.locust_runner.stats)
         if options.csvfilebase:
-            write_stat_csvs(options.csvfilebase, options.stats_history_enabled)
+            write_stat_csvs(options.csvfilebase, options.csv_stats_history_enabled)
+
+        if options.mongo:
+            import pandas as pd
+            from io import StringIO
+
+            docs = write_stats_history_to_mongo(
+                mongo_client[options.mongo_db]['stats_history'],
+                stats_history_enabled=options.mongo_stats_history_enabled,
+                tags=mongo_tags
+            )
+
+            files = {
+                'stats_agg': StringIO(requests_csv()),
+                'failures': StringIO(failures_csv()),
+            }
+
+            for col, filename in files.items():
+                try:
+                    df = pd.read_csv(filename)
+                    if len(df) == 0:    # Empty lists not allowed for `insert_many`
+                        logger.warning('collection %s not found', col)
+                        continue
+                    df = df.assign(**mongo_tags)
+                    df = df.rename(columns=_encode_mongo_key)
+                    rows = list(df.to_dict(orient='index').values())
+                    mongo_client[options.mongo_db][col].insert_many(rows)
+                except FileNotFoundError:
+                    logger.warning('collection %s not found', col)
+                    continue
+
         print_error_report()
         sys.exit(code)
     
