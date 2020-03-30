@@ -113,16 +113,19 @@ def parse_options(args=None, default_config_files=['~/.locust.conf','locust.conf
     parser.add_argument(
         '--mongo-workload-tag',
         help="MongoDB document tag indicating the workload.",
+        env_var='MONGO_WORKLOAD_TAG',
     )
 
     parser.add_argument(
         '--mongo-env-tag',
         help="MongoDB document tag indicating the environment.",
+        env_var='MONGO_ENV_TAG',
     )
 
     parser.add_argument(
         '--mongo-exp-tag',
         help="MongoDB document tag indicating the experiment id.",
+        env_var='MONGO_EXP_TAG',
     )
 
     # if locust should be run in distributed mode as master
