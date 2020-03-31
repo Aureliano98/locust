@@ -794,7 +794,7 @@ def write_stats_history_to_mongo(collection, stats_history_enabled=False, tags=N
     if not rows:
         return
     docs = [
-        dict(zip(keys, rows))
+        dict(zip(keys, row))
         for row in rows
     ]
     if tags:
